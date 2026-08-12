@@ -43,8 +43,28 @@ app.get('/healthz', (_req, res) => {
 });
 
 const httpServer = http.createServer(app);
+
+/* ----------------------------------------------------------------------------
+ * CORS (SRS §3.2 deployment shape 2: "frontend hosted anywhere + signaling on
+ * any Node host"). Socket.io v4 sends no CORS headers by default, which would
+ * break every cross-origin connection (static host / Vercel / Live Server +
+ * separate signaling process). We therefore reflect the requester's origin by
+ * default — safe here: the server stores nothing and authenticates nobody
+ * (SRS §2.2 "post box, not a service"). Restrict via env if required:
+ *   SIGNALING_CORS="https://my-frontend.example"   single origin
+ *   SIGNALING_CORS="https://a.example,https://b.example"  allow-list
+ *   SIGNALING_CORS="*"                              wildcard (any)
+ * -------------------------------------------------------------------------- */
+function resolveCorsOrigin() {
+  const raw = process.env.SIGNALING_CORS;
+  if (!raw || raw === "true") return true; // true = reflect requester origin
+  if (raw === "*") return "*";
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 const io = new Server(httpServer, {
   /* Default path (/socket.io/) — matches the SRS client wiring. */
+  cors: { origin: resolveCorsOrigin(), methods: ["GET", "POST"] },
 });
 
 /* ----------------------------------------------------------------------------
@@ -230,5 +250,13 @@ io.on('connection', (socket) => {
 httpServer.listen(PORT, () => {
   console.log(
     `[signal] post box open on :${PORT} — routing public key rooms, seeing no messages`
+  );
+  console.log(
+    `[signal] frontend + Socket.io share this port — open http://localhost:${PORT}`
+  );
+  console.log(
+    `[signal] endpoint /socket.io/ (CORS: ${
+      process.env.SIGNALING_CORS || "reflect-requester-origin"
+    })`
   );
 });
