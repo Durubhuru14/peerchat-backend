@@ -148,9 +148,16 @@ io.on('connection', (socket) => {
      * `PEER UNAVAILABLE`. No server event is specified for this case. */
     if (!targetEntry) return;
 
-    /* Room-full: target already in a session (SRS §3.3, §8.7, E-06). */
+    /* Room-full: target already in a session (SRS §3.3, §8.7, E-06).
+     * v2.1 (SRS v2.5 §3.3): the busy peer also gets a one-way
+     * `knock-blocked` notice so a missed connection attempt is visible
+     * instead of silently dropped. The knock itself is still dropped —
+     * single-session semantics are unchanged. */
     if (targetEntry.connectedTo !== null) {
       socket.emit('room-full', { to: targetPublicKey });
+      io.to(targetEntry.socketId).emit('knock-blocked', {
+        from: initiatorPublicKey,
+      });
       return;
     }
 
