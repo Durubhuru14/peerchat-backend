@@ -1,19 +1,38 @@
 /**
  * ============================================================================
  * DECENTRALISED P2P CHAT — SIGNALING SERVER
- * SRS v2.3 — Sections 3.3, 3.4, 3.5, 8.7, 15.4
+ * SRS v2.6 — Sections 3.3, 3.4, 3.5, 8.7, 15.4 + v2.2 §19 (mesh sessions)
  * ----------------------------------------------------------------------------
  * "The signaling server is a post box, not a service."        (SRS §2.2)
  *
- * Responsibilities (SRS §3.3):
+ * Responsibilities (SRS §3.3, revised for v2.2 mesh):
  *   - Accept peer socket connections
  *   - Register each peer against their public key as a channel ("room")
  *   - Route WebRTC offer, answer, and ICE candidates between channels
  *   - Route knock payloads (ECDSA public key + ECDH session public key)
- *   - Notify a peer when the other side disconnects
- *   - Emit `room-full` when the target channel is busy, drop the knock
- *   - v2.3 §15.4: clear stale `connectedTo` state at the top of the knock
- *     handler, before the room-full check
+ *   - Notify a peer when the other side of ANY of its sessions goes away
+ *
+ * MESH SESSIONS (v2.2, SRS v2.6 §19 / FR-51):
+ *   V1 allowed ONE live session per peer (`connectedTo`, single string) and
+ *   answered any further knock with `room-full` (E-06). v2.2 removes that
+ *   limit: a peer may hold any number of simultaneous DataChannels — one per
+ *   remote peer. The server therefore tracks PAIRS, not single links:
+ *
+ *     rooms:        Map<publicKey, { socketId }>          — channel ownership
+ *     pairSessions: Map<pairId, { a, b, state, createdAt }>
+ *
+ *   Pair states: "pending" (knock forwarded, handshake running) → "open"
+ *   (client confirms via `session-open` once the DataChannel is live).
+ *   A pair is removed on `knock-reject`, `session-end` (clean disconnect),
+ *   socket disconnect of either side, or the stale-pending sweep (§15.4
+ *   successor: handshakes that never complete are reaped lazily).
+ *
+ * `room-full` survives with NARROWER meaning (E-06, revised): the SAME pair
+ * already has a session or handshake in flight — the knock is dropped so two
+ * parallel handshakes between two peers cannot interleave their SDP. A third
+ * peer knocking a busy-looking target is now ALWAYS forwarded: busy is no
+ * longer a server-side concept. The target still receives `knock-blocked`
+ * as a transient "someone tried to reach you on an existing pair" notice.
  *
  * Explicitly NOT done here (SRS §3.4):
  *   - No storage, reading, or logging of messages
@@ -30,6 +49,12 @@ const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3000;
 
+/* A handshake that never completes is reaped after this long (§15.4 successor:
+ * knock 30s + ICE 15s + slack). "open" pairs are exempt — they end only via
+ * session-end, knock-reject or socket disconnect. */
+const PENDING_PAIR_TTL_MS = 75_000;
+const SWEEP_INTERVAL_MS = 30_000;
+
 /* ----------------------------------------------------------------------------
  * HTTP layer — serves the static vanilla frontend (local dev convenience).
  * In production the frontend may be hosted anywhere (SRS §3.2 "Vercel (frontend)
@@ -39,7 +64,7 @@ const app = express();
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ ok: true, peers: rooms.size });
+  res.status(200).json({ ok: true, peers: rooms.size, pairs: pairSessions.size });
 });
 
 const httpServer = http.createServer(app);
@@ -68,18 +93,53 @@ const io = new Server(httpServer, {
 });
 
 /* ----------------------------------------------------------------------------
- * Room model (SRS §3.5 — "Your public key is your room")
+ * Room model (SRS §3.5 — "Your public key is your room", v2.2 mesh form)
  *
- *   rooms:       Map<publicKeyString, { socketId, connectedTo }>
- *   socketToKey: Map<socketId, publicKeyString>  (reverse lookup, cleanup aid)
+ *   rooms:        Map<publicKeyString, { socketId }>
+ *   socketToKey:  Map<socketId, publicKeyString>   (reverse lookup / cleanup)
+ *   pairSessions: Map<pairId, { a, b, state, createdAt }>
  *
- * `connectedTo` is set when a knock is FORWARDED (SRS C-12) and cleared:
- *   - at the top of every new knock by the initiator (§15.4 step 1)
- *   - when the far end is no longer in rooms (§15.4 step 2)
- *   - when a socket disconnects / a knock is rejected (mutual cleanup)
+ * pairId is the two key strings sorted and joined — order-independent, so
+ * whichever side knocks, the pair lands under the same id. Each socket may
+ * own several pairs at once (mesh). All pair state lives in memory only and
+ * dies with the sockets (SRS §3.4 — nothing persists).
  * -------------------------------------------------------------------------- */
 const rooms = new Map();
 const socketToKey = new Map();
+const pairSessions = new Map();
+
+const PAIR_SEP = '\u241E'; // ASCII "Record Separator" — never appears in JWK JSON
+
+function pairIdOf(keyA, keyB) {
+  return [keyA, keyB].sort().join(PAIR_SEP);
+}
+
+function getPair(keyA, keyB) {
+  return pairSessions.get(pairIdOf(keyA, keyB)) || null;
+}
+
+function addPair(keyA, keyB) {
+  pairSessions.set(pairIdOf(keyA, keyB), {
+    a: keyA,
+    b: keyB,
+    state: 'pending',
+    createdAt: Date.now(),
+  });
+}
+
+function removePair(keyA, keyB) {
+  pairSessions.delete(pairIdOf(keyA, keyB));
+}
+
+/** Every partner key this peer currently shares a pair with (mesh: many). */
+function partnersOf(publicKey) {
+  const partners = [];
+  for (const pair of pairSessions.values()) {
+    if (pair.a === publicKey) partners.push(pair.b);
+    else if (pair.b === publicKey) partners.push(pair.a);
+  }
+  return partners;
+}
 
 /** Register (or re-register after refresh/reconnect) a socket in its room. */
 function joinRoom(socket, publicKey) {
@@ -87,8 +147,8 @@ function joinRoom(socket, publicKey) {
 
   // A second tab / page refresh re-joins the same room: the newest socket
   // becomes the owner of the channel. The previous session state dies with
-  // the old socket (its disconnect handler notifies the partner).
-  rooms.set(publicKey, { socketId: socket.id, connectedTo: null });
+  // the old socket (its disconnect handler notifies every partner).
+  rooms.set(publicKey, { socketId: socket.id });
   socketToKey.set(socket.id, publicKey);
 }
 
@@ -99,6 +159,18 @@ function emitToRoom(publicKey, event, payload) {
   io.to(entry.socketId).emit(event, payload);
   return true;
 }
+
+/* §15.4 successor — lazy stale-pending sweep. Handshakes that never completed
+ * (peer went silent mid-offer, signaling died during the ladder, …) are
+ * removed so a retrying initiator is never wrongly answered room-full. */
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, pair] of pairSessions) {
+    if (pair.state === 'pending' && now - pair.createdAt > PENDING_PAIR_TTL_MS) {
+      pairSessions.delete(id);
+    }
+  }
+}, SWEEP_INTERVAL_MS).unref?.();
 
 io.on('connection', (socket) => {
   /* -- Client -> server: subscribe to own public key channel (FR-05) ----- */
@@ -111,6 +183,8 @@ io.on('connection', (socket) => {
    * `from` is NOT taken from the payload — the server derives it from the
    * sender's registered room key. This makes key spoofing on the routing
    * layer impossible (design decision, documented in DOCUMENTATION.md).
+   * Mesh (v2.2): a busy target is no longer a reason to drop a knock — a
+   * pair entry only blocks a SECOND handshake between the SAME two peers.
    * ---------------------------------------------------------------------- */
   socket.on('knock', (data) => {
     const initiatorPublicKey = socketToKey.get(socket.id);
@@ -119,41 +193,19 @@ io.on('connection', (socket) => {
     const targetPublicKey = data.to;
     if (typeof targetPublicKey !== 'string') return;
 
-    /* v2.3 §15.4 — stale connectedTo cleanup, runs BEFORE the room-full
-     * check, exactly as specified:
-     * 1. Clear initiator's stale connectedTo (enables retry after a failed
-     *    handshake). If the stale target still points back at us, clear it
-     *    too so both sides are consistent.
-     * 2. Clear target's stale connectedTo if that peer left rooms entirely. */
-    const initEntry = rooms.get(initiatorPublicKey);
-    if (initEntry && initEntry.connectedTo) {
-      const staleTarget = rooms.get(initEntry.connectedTo);
-      if (staleTarget && staleTarget.connectedTo === initiatorPublicKey) {
-        staleTarget.connectedTo = null;
-      }
-      initEntry.connectedTo = null;
-    }
-
-    const targetEntry = rooms.get(targetPublicKey);
-    if (
-      targetEntry &&
-      targetEntry.connectedTo !== null &&
-      !rooms.has(targetEntry.connectedTo)
-    ) {
-      targetEntry.connectedTo = null;
-    }
-
     /* Target not listening: the knock goes unanswered (SRS §3.5). The
      * offerer's 30 s knock timeout (SRS §8.3, E-04) surfaces this as
      * `PEER UNAVAILABLE`. No server event is specified for this case. */
+    const targetEntry = rooms.get(targetPublicKey);
     if (!targetEntry) return;
 
-    /* Room-full: target already in a session (SRS §3.3, §8.7, E-06).
-     * v2.1 (SRS v2.5 §3.3): the busy peer also gets a one-way
-     * `knock-blocked` notice so a missed connection attempt is visible
-     * instead of silently dropped. The knock itself is still dropped —
-     * single-session semantics are unchanged. */
-    if (targetEntry.connectedTo !== null) {
+    /* E-06, revised for mesh: the SAME pair already has a handshake or a
+     * live session in flight. Dropping the knock prevents two parallel
+     * handshakes A→B from interleaving their SDP. The busy target also
+     * gets a one-way `knock-blocked` notice (v2.1) so a stale-state retry
+     * is visible on the other side instead of silently vanishing. */
+    const existingPair = getPair(initiatorPublicKey, targetPublicKey);
+    if (existingPair) {
       socket.emit('room-full', { to: targetPublicKey });
       io.to(targetEntry.socketId).emit('knock-blocked', {
         from: initiatorPublicKey,
@@ -161,12 +213,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    /* Forward the knock (SRS §4.5 payload: from, ecdh_public_key, timestamp).
-     * C-12: connectedTo is set when the knock is forwarded, BEFORE WebRTC
-     * completes — stale state on failed handshakes is cleaned lazily by the
-     * §15.4 logic above on the next knock. */
-    targetEntry.connectedTo = initiatorPublicKey;
-    if (initEntry) initEntry.connectedTo = targetPublicKey;
+    /* Forward the knock (SRS §4.5 payload: from, ecdh_public_key, timestamp)
+     * and record the pending pair. C-12's intent (state set at forward time,
+     * cleaned lazily) survives via the pair map + sweep above. */
+    addPair(initiatorPublicKey, targetPublicKey);
 
     emitToRoom(targetPublicKey, 'knock', {
       from: initiatorPublicKey,
@@ -195,13 +245,32 @@ io.on('connection', (socket) => {
 
     emitToRoom(data.to, 'knock-rejected', { from: answererPublicKey });
 
-    // Definite end of handshake: clear the mutual connectedTo marks so the
-    // answerer is not wrongly reported busy (room-full) afterwards.
-    const answererEntry = rooms.get(answererPublicKey);
-    const initiatorEntry = rooms.get(data.to);
-    if (answererEntry) answererEntry.connectedTo = null;
-    if (initiatorEntry && initiatorEntry.connectedTo === answererPublicKey) {
-      initiatorEntry.connectedTo = null;
+    // Definite end of handshake: clear the pair so a retry is never
+    // wrongly answered room-full afterwards.
+    removePair(answererPublicKey, data.to);
+  });
+
+  /* -- Client -> server: the DataChannel for a pair is OPEN (v2.2) -------- */
+  socket.on('session-open', (data) => {
+    const from = socketToKey.get(socket.id);
+    if (!from || !data || typeof data.to !== 'string') return;
+    const pair = getPair(from, data.to);
+    if (pair) pair.state = 'open';
+  });
+
+  /* -- Client -> server: this side ended the session (v2.2 clean
+   * disconnect — FR-53). Remove the pair; if the session had reached
+   * "open", tell the far side so its UI can settle immediately instead of
+   * waiting for ICE/DC timers to notice. Pending pairs end silently —
+   * both sides' own §8.3 timeouts already cover handshake failure. */
+  socket.on('session-end', (data) => {
+    const from = socketToKey.get(socket.id);
+    if (!from || !data || typeof data.to !== 'string') return;
+
+    const pair = getPair(from, data.to);
+    removePair(from, data.to);
+    if (pair && pair.state === 'open') {
+      emitToRoom(data.to, 'session-closed', { from });
     }
   });
 
@@ -226,7 +295,8 @@ io.on('connection', (socket) => {
     emitToRoom(data.to, 'ice-candidate', { from, candidate: data.candidate });
   });
 
-  /* -- Socket teardown: notify the session partner (SRS §3.3, UC-09) ------- */
+  /* -- Socket teardown: notify EVERY session partner (SRS §3.3, UC-09,
+   * mesh generalisation) — one peer may be in many pairs at once. --------- */
   socket.on('disconnect', () => {
     const publicKey = socketToKey.get(socket.id);
     if (!publicKey) return;
@@ -240,16 +310,9 @@ io.on('connection', (socket) => {
 
     rooms.delete(publicKey);
 
-    if (entry.connectedTo) {
-      const partnerEntry = rooms.get(entry.connectedTo);
-      if (partnerEntry) {
-        io.to(partnerEntry.socketId).emit('peer-disconnected', {
-          publicKey,
-        });
-        if (partnerEntry.connectedTo === publicKey) {
-          partnerEntry.connectedTo = null;
-        }
-      }
+    for (const partner of partnersOf(publicKey)) {
+      removePair(publicKey, partner);
+      emitToRoom(partner, 'peer-disconnected', { publicKey });
     }
   });
 });
@@ -265,5 +328,8 @@ httpServer.listen(PORT, () => {
     `[signal] endpoint /socket.io/ (CORS: ${
       process.env.SIGNALING_CORS || "reflect-requester-origin"
     })`
+  );
+  console.log(
+    `[signal] mesh mode (v2.2): multiple simultaneous sessions per peer, pair-level busy guard only`
   );
 });
