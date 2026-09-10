@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * DECENTRALISED P2P CHAT — SIGNALING SERVER
- * SRS v2.6 — Sections 3.3, 3.4, 3.5, 8.7, 15.4 + v2.2 §19 (mesh sessions)
+ * PEERCHAT — SIGNALING SERVER
+ * SRS v2.8 — Sections 3.3, 3.4, 3.5, 8.7, 15.4 + v2.2 §19 (mesh sessions)
  * ----------------------------------------------------------------------------
  * "The signaling server is a post box, not a service."        (SRS §2.2)
  *
@@ -61,7 +61,7 @@ const SWEEP_INTERVAL_MS = 30_000;
  * + any Node host (signaling)"); this server only NEEDS the Socket.io part.
  * -------------------------------------------------------------------------- */
 const app = express();
-app.use(express.static(path.join(__dirname, '..', 'public')));
+app.use(express.static(path.join(__dirname, '..', 'frontend')));
 
 app.get('/healthz', (_req, res) => {
   res.status(200).json({ ok: true, peers: rooms.size, pairs: pairSessions.size });
