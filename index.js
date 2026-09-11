@@ -44,6 +44,7 @@
 
 const express = require('express');
 const http = require('http');
+const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
 
@@ -59,9 +60,27 @@ const SWEEP_INTERVAL_MS = 30_000;
  * HTTP layer — serves the static vanilla frontend (local dev convenience).
  * In production the frontend may be hosted anywhere (SRS §3.2 "Vercel (frontend)
  * + any Node host (signaling)"); this server only NEEDS the Socket.io part.
+ *
+ * When frontend/ is absent next to this file (backend deployed alone, e.g. as
+ * a Render service from the backend/ repo), we skip the static layer and keep
+ * "/" answerable with a plain-text note so host health checks see a clean 200
+ * instead of a 404/500. Signaling is unaffected either way.
  * -------------------------------------------------------------------------- */
+const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
+const frontendPresent = fs.existsSync(FRONTEND_DIR);
+
 const app = express();
-app.use(express.static(path.join(__dirname, '..', 'frontend')));
+if (frontendPresent) {
+  app.use(express.static(FRONTEND_DIR));
+} else {
+  app.get('/', (_req, res) => {
+    res.type('text/plain').send(
+      'PeerChat signaling server is running (signaling-only mode — the ' +
+        'frontend is deployed separately). Point frontend/js/config.js ' +
+        'signalingPath at this origin. Status: /healthz'
+    );
+  });
+}
 
 app.get('/healthz', (_req, res) => {
   res.status(200).json({ ok: true, peers: rooms.size, pairs: pairSessions.size });
@@ -321,9 +340,15 @@ httpServer.listen(PORT, () => {
   console.log(
     `[signal] post box open on :${PORT} — routing public key rooms, seeing no messages`
   );
-  console.log(
-    `[signal] frontend + Socket.io share this port — open http://localhost:${PORT}`
-  );
+  if (frontendPresent) {
+    console.log(
+      `[signal] frontend + Socket.io share this port — open http://localhost:${PORT}`
+    );
+  } else {
+    console.log(
+      `[signal] signaling-only mode — frontend/ not found next to backend/ (frontend hosted separately, e.g. Netlify)`
+    );
+  }
   console.log(
     `[signal] endpoint /socket.io/ (CORS: ${
       process.env.SIGNALING_CORS || "reflect-requester-origin"

@@ -1,0 +1,26 @@
+{
+  "name": "peerchat-backend",
+  "version": "2.3.0",
+  "description": "PeerChat signaling server — zero-knowledge WebRTC post box (public-key rooms, knock/accept, SDP + ICE relay). Deployable standalone (e.g. Render); pairs with the PeerChat frontend/ repo on any static host (Netlify or equivalent). Point the frontend at this service via js/config.js signalingPath.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "overrides": {
+    "qs": "^6.16.0",
+    "proxy-addr": "^2.0.8",
+    "braces": "^3.0.3",
+    "source-map-js": "^1.2.2",
+    "@parcel/watcher": "^2.6.0"
+  },
+  "license": "MIT"
+}
