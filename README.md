@@ -87,9 +87,7 @@ window.APP_CONFIG = { signalingPath: "https://your-service.onrender.com", status
 
 ## The other halves
 
-- **`frontend/`** — the static browser app (deploy that one to Netlify).
-- **Root `peerchat/` archive** — full docs: SRS v2.8, DOCUMENTATION.md,
-  WORKLOG.md, UML diagrams, screenshots, and the 59-check test suite.
+- **[frontend/](https://github.com/Durubhuru14/peerchat-frontend)** — the static browser app (deploy that one to Netlify).
 
 ## Stack & license
 
